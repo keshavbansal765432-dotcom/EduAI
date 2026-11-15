@@ -1,0 +1,269 @@
+-- Run this whole file in Supabase SQL Editor.
+create extension if not exists pgcrypto;
+do $$ begin
+  create type public.user_role as enum ('admin','teacher');
+exception when duplicate_object then null;
+end $$;
+
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  full_name text not null default '', email text, role public.user_role not null default 'teacher',
+  avatar_url text, active boolean not null default true, created_at timestamptz not null default now()
+);
+create table if not exists public.classes (
+  id uuid primary key default gen_random_uuid(), name text not null, section text not null, academic_year text not null default '2026-27', teacher_id uuid references public.profiles(id) on delete set null, room text, created_at timestamptz not null default now(), unique(name,section,academic_year)
+);
+create table if not exists public.students (
+  id uuid primary key default gen_random_uuid(), admission_no text unique not null, full_name text not null, class_id uuid references public.classes(id) on delete set null, roll_no integer, guardian_name text, guardian_phone text, active boolean not null default true, created_at timestamptz not null default now()
+);
+create table if not exists public.subjects (
+  id uuid primary key default gen_random_uuid(), name text not null, class_id uuid references public.classes(id) on delete cascade, description text, created_at timestamptz not null default now(), unique(name,class_id)
+);
+create table if not exists public.attendance (
+  id uuid primary key default gen_random_uuid(), student_id uuid not null references public.students(id) on delete cascade, class_id uuid not null references public.classes(id) on delete cascade, attendance_date date not null, status text not null check(status in ('present','absent','late')), marked_by uuid references public.profiles(id) on delete set null, created_at timestamptz not null default now(), unique(student_id,attendance_date)
+);
+create table if not exists public.assignments (
+  id uuid primary key default gen_random_uuid(), title text not null, description text, class_id uuid references public.classes(id) on delete cascade, subject_id uuid references public.subjects(id) on delete set null, due_date date, created_by uuid references public.profiles(id) on delete set null, created_at timestamptz not null default now()
+);
+create table if not exists public.notices (
+  id uuid primary key default gen_random_uuid(), title text not null, body text not null, audience text not null default 'all', created_by uuid references public.profiles(id) on delete set null, created_at timestamptz not null default now()
+);
+create table if not exists public.timetable (
+  id uuid primary key default gen_random_uuid(), class_id uuid references public.classes(id) on delete cascade, subject_id uuid references public.subjects(id) on delete set null, day_of_week int not null check(day_of_week between 1 and 7), start_time time not null, end_time time not null, room text
+);
+
+create table if not exists public.syllabus_units (
+  id uuid primary key default gen_random_uuid(),
+  class_id uuid not null references public.classes(id) on delete cascade,
+  subject_id uuid not null references public.subjects(id) on delete cascade,
+  unit_title text not null,
+  details text not null default '',
+  created_by uuid references public.profiles(id) on delete set null,
+  created_at timestamptz not null default now(),
+  unique(class_id, subject_id, unit_title)
+);
+create index if not exists syllabus_units_class_subject_idx on public.syllabus_units(class_id, subject_id);
+
+create table if not exists public.classroom_lessons (
+  id uuid primary key default gen_random_uuid(),
+  class_id uuid not null references public.classes(id) on delete cascade,
+  subject_id uuid references public.subjects(id) on delete set null,
+  title text not null,
+  description text not null default '',
+  slides jsonb not null default '[]'::jsonb,
+  created_by uuid references public.profiles(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists classroom_lessons_class_idx on public.classroom_lessons(class_id);
+create index if not exists assignments_class_idx on public.assignments(class_id);
+create index if not exists attendance_class_date_idx on public.attendance(class_id,attendance_date);
+
+
+create or replace function public.handle_new_user() returns trigger language plpgsql security definer set search_path=public as $$
+begin insert into public.profiles(id,full_name,email,role) values(new.id,coalesce(new.raw_user_meta_data->>'full_name',''),new.email,'teacher'); return new; end; $$;
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
+
+create or replace function public.is_admin() returns boolean language sql stable security definer set search_path=public as $$ select exists(select 1 from public.profiles where id=auth.uid() and role='admin' and active=true); $$;
+create or replace function public.is_teacher() returns boolean language sql stable security definer set search_path=public as $$ select exists(select 1 from public.profiles where id=auth.uid() and role='teacher' and active=true); $$;
+
+alter table public.profiles enable row level security;
+alter table public.classes enable row level security;
+alter table public.students enable row level security;
+alter table public.subjects enable row level security;
+alter table public.attendance enable row level security;
+alter table public.assignments enable row level security;
+alter table public.notices enable row level security;
+alter table public.timetable enable row level security;
+alter table public.classroom_lessons enable row level security;
+alter table public.syllabus_units enable row level security;
+
+drop policy if exists profiles_self on public.profiles;
+drop policy if exists profiles_admin on public.profiles;
+create policy profiles_self on public.profiles for select using(id=auth.uid() or public.is_admin());
+create policy profiles_admin on public.profiles for all using(public.is_admin()) with check(public.is_admin());
+
+drop policy if exists classes_read on public.classes;
+drop policy if exists classes_admin on public.classes;
+create policy classes_read on public.classes for select using(public.is_admin() or (public.is_teacher() and teacher_id=auth.uid()));
+create policy classes_admin on public.classes for all using(public.is_admin()) with check(public.is_admin());
+
+drop policy if exists students_read on public.students;
+drop policy if exists students_admin on public.students;
+create policy students_read on public.students for select using(public.is_admin() or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+create policy students_admin on public.students for all using(public.is_admin()) with check(public.is_admin());
+
+drop policy if exists subjects_read on public.subjects;
+drop policy if exists subjects_admin on public.subjects;
+create policy subjects_read on public.subjects for select using(public.is_admin() or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+create policy subjects_admin on public.subjects for all using(public.is_admin()) with check(public.is_admin());
+
+drop policy if exists attendance_access on public.attendance;
+create policy attendance_access on public.attendance for all using(public.is_admin() or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid()))) with check(public.is_admin() or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+
+drop policy if exists assignments_access on public.assignments;
+create policy assignments_access on public.assignments for all using(public.is_admin() or (public.is_teacher() and (created_by=auth.uid() or exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())))) with check(public.is_admin() or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+
+drop policy if exists notices_access on public.notices;
+create policy notices_access on public.notices for select using(public.is_admin() or public.is_teacher());
+create policy notices_admin on public.notices for all using(public.is_admin()) with check(public.is_admin());
+
+drop policy if exists timetable_access on public.timetable;
+create policy timetable_access on public.timetable for select using(public.is_admin() or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+create policy timetable_admin on public.timetable for all using(public.is_admin()) with check(public.is_admin());
+
+create or replace function public.teacher_id_is_owner(owner_id uuid, class_id_value uuid, teacher_id_value uuid) returns boolean language sql stable security definer set search_path=public as $$ select owner_id=teacher_id_value and exists(select 1 from public.classes where id=class_id_value and teacher_id=teacher_id_value); $$;
+
+drop policy if exists classroom_lessons_teacher_read on public.classroom_lessons;
+drop policy if exists classroom_lessons_teacher_write on public.classroom_lessons;
+drop policy if exists classroom_lessons_admin on public.classroom_lessons;
+create policy classroom_lessons_teacher_read on public.classroom_lessons for select using(public.is_admin() or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+create policy classroom_lessons_teacher_write on public.classroom_lessons for all using(public.teacher_id_is_owner(created_by, class_id, auth.uid())) with check(public.is_teacher() and created_by=auth.uid() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid()));
+create policy classroom_lessons_admin on public.classroom_lessons for all using(public.is_admin()) with check(public.is_admin());
+
+-- After registering the first account, make it an admin by replacing the email below:
+-- update public.profiles set role='admin' where email='admin@your-school.com';
+
+
+drop policy if exists syllabus_units_read on public.syllabus_units;
+drop policy if exists syllabus_units_admin on public.syllabus_units;
+create policy syllabus_units_read on public.syllabus_units for select using (
+  public.is_admin() or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid()))
+);
+create policy syllabus_units_admin on public.syllabus_units for all using(public.is_admin()) with check(public.is_admin());
+
+
+-- ===== Multi-school support (db/migrations/20261115_multi_school.sql) =====
+-- Multi-school support: every school's data is isolated by school_id.
+-- Safe to re-run. Existing single-school data is moved into one school called "My School"
+-- (rename it in the `schools` table).
+
+create table if not exists public.schools (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz not null default now()
+);
+alter table public.schools enable row level security;
+
+alter table public.profiles          add column if not exists school_id uuid references public.schools(id) on delete cascade;
+alter table public.classes           add column if not exists school_id uuid references public.schools(id) on delete cascade;
+alter table public.students          add column if not exists school_id uuid references public.schools(id) on delete cascade;
+alter table public.subjects          add column if not exists school_id uuid references public.schools(id) on delete cascade;
+alter table public.attendance        add column if not exists school_id uuid references public.schools(id) on delete cascade;
+alter table public.assignments       add column if not exists school_id uuid references public.schools(id) on delete cascade;
+alter table public.notices           add column if not exists school_id uuid references public.schools(id) on delete cascade;
+alter table public.timetable         add column if not exists school_id uuid references public.schools(id) on delete cascade;
+alter table public.syllabus_units    add column if not exists school_id uuid references public.schools(id) on delete cascade;
+alter table public.classroom_lessons add column if not exists school_id uuid references public.schools(id) on delete cascade;
+
+-- Backfill existing data into one default school.
+do $$
+declare sid uuid;
+begin
+  if (select count(*) from public.schools)=0
+     and (exists(select 1 from public.profiles) or exists(select 1 from public.classes)) then
+    insert into public.schools(name) values ('My School') returning id into sid;
+  else
+    select id into sid from public.schools order by created_at limit 1;
+  end if;
+  if sid is not null then
+    update public.profiles          set school_id=sid where school_id is null;
+    update public.classes           set school_id=sid where school_id is null;
+    update public.students          set school_id=sid where school_id is null;
+    update public.subjects          set school_id=sid where school_id is null;
+    update public.attendance        set school_id=sid where school_id is null;
+    update public.assignments       set school_id=sid where school_id is null;
+    update public.notices           set school_id=sid where school_id is null;
+    update public.timetable         set school_id=sid where school_id is null;
+    update public.syllabus_units    set school_id=sid where school_id is null;
+    update public.classroom_lessons set school_id=sid where school_id is null;
+  end if;
+end $$;
+
+-- profiles.school_id stays nullable (the auth trigger creates the profile before the school is known).
+alter table public.classes           alter column school_id set not null;
+alter table public.students          alter column school_id set not null;
+alter table public.subjects          alter column school_id set not null;
+alter table public.attendance        alter column school_id set not null;
+alter table public.assignments       alter column school_id set not null;
+alter table public.notices           alter column school_id set not null;
+alter table public.timetable         alter column school_id set not null;
+alter table public.syllabus_units    alter column school_id set not null;
+alter table public.classroom_lessons alter column school_id set not null;
+
+-- Admission numbers only need to be unique inside one school.
+alter table public.students drop constraint if exists students_admission_no_key;
+do $$ begin
+  alter table public.students add constraint students_school_admission_key unique (school_id, admission_no);
+exception when duplicate_table or duplicate_object then null; end $$;
+
+create index if not exists profiles_school_idx   on public.profiles(school_id);
+create index if not exists classes_school_idx    on public.classes(school_id);
+create index if not exists students_school_idx   on public.students(school_id);
+create index if not exists subjects_school_idx   on public.subjects(school_id);
+create index if not exists notices_school_idx    on public.notices(school_id);
+create index if not exists timetable_school_idx  on public.timetable(school_id);
+
+create or replace function public.current_school_id() returns uuid language sql stable security definer set search_path=public as $$
+  select school_id from public.profiles where id=auth.uid() and active=true;
+$$;
+-- True when the caller is an admin of the school that owns the row.
+create or replace function public.is_school_admin(sid uuid) returns boolean language sql stable security definer set search_path=public as $$
+  select public.is_admin() and sid is not null and sid=public.current_school_id();
+$$;
+
+-- Row level security (also what Realtime uses, so one school never receives another school's events).
+drop policy if exists schools_read on public.schools;
+create policy schools_read on public.schools for select using(id=public.current_school_id());
+
+drop policy if exists profiles_self on public.profiles;
+drop policy if exists profiles_admin on public.profiles;
+create policy profiles_self on public.profiles for select using(id=auth.uid() or public.is_school_admin(school_id));
+create policy profiles_admin on public.profiles for all using(public.is_school_admin(school_id)) with check(public.is_school_admin(school_id));
+
+drop policy if exists classes_read on public.classes;
+drop policy if exists classes_admin on public.classes;
+create policy classes_read on public.classes for select using(public.is_school_admin(school_id) or (public.is_teacher() and teacher_id=auth.uid()));
+create policy classes_admin on public.classes for all using(public.is_school_admin(school_id)) with check(public.is_school_admin(school_id));
+
+drop policy if exists students_read on public.students;
+drop policy if exists students_admin on public.students;
+create policy students_read on public.students for select using(public.is_school_admin(school_id) or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+create policy students_admin on public.students for all using(public.is_school_admin(school_id)) with check(public.is_school_admin(school_id));
+
+drop policy if exists subjects_read on public.subjects;
+drop policy if exists subjects_admin on public.subjects;
+create policy subjects_read on public.subjects for select using(public.is_school_admin(school_id) or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+create policy subjects_admin on public.subjects for all using(public.is_school_admin(school_id)) with check(public.is_school_admin(school_id));
+
+drop policy if exists attendance_access on public.attendance;
+create policy attendance_access on public.attendance for all
+  using(public.is_school_admin(school_id) or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())))
+  with check(public.is_school_admin(school_id) or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+
+drop policy if exists assignments_access on public.assignments;
+create policy assignments_access on public.assignments for all
+  using(public.is_school_admin(school_id) or (public.is_teacher() and (created_by=auth.uid() or exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid()))))
+  with check(public.is_school_admin(school_id) or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+
+drop policy if exists notices_access on public.notices;
+drop policy if exists notices_admin on public.notices;
+create policy notices_access on public.notices for select using(school_id=public.current_school_id() and (public.is_admin() or public.is_teacher()));
+create policy notices_admin on public.notices for all using(public.is_school_admin(school_id)) with check(public.is_school_admin(school_id));
+
+drop policy if exists timetable_access on public.timetable;
+drop policy if exists timetable_admin on public.timetable;
+create policy timetable_access on public.timetable for select using(public.is_school_admin(school_id) or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+create policy timetable_admin on public.timetable for all using(public.is_school_admin(school_id)) with check(public.is_school_admin(school_id));
+
+drop policy if exists classroom_lessons_teacher_read on public.classroom_lessons;
+drop policy if exists classroom_lessons_admin on public.classroom_lessons;
+create policy classroom_lessons_teacher_read on public.classroom_lessons for select using(public.is_school_admin(school_id) or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+create policy classroom_lessons_admin on public.classroom_lessons for all using(public.is_school_admin(school_id)) with check(public.is_school_admin(school_id));
+
+drop policy if exists syllabus_units_read on public.syllabus_units;
+drop policy if exists syllabus_units_admin on public.syllabus_units;
+create policy syllabus_units_read on public.syllabus_units for select using(public.is_school_admin(school_id) or (public.is_teacher() and exists(select 1 from public.classes c where c.id=class_id and c.teacher_id=auth.uid())));
+create policy syllabus_units_admin on public.syllabus_units for all using(public.is_school_admin(school_id)) with check(public.is_school_admin(school_id));

@@ -1,0 +1,1 @@
+export default function Loading(){return <div className="shell"><aside className="sidebar"/><main className="main"><div className="content"><div className="card panel" style={{minHeight:180,opacity:.5}}>Loading…</div></div></main></div>}
